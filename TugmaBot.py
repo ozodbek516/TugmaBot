@@ -1,623 +1,334 @@
-"""
-Savol-javob kanal boti.
-"""
-
-import asyncio
-import datetime
-import html
-import logging
 import os
 import sqlite3
-from contextlib import closing
+import logging
+from datetime import datetime, timedelta
+from dotenv import load_dotenv
 
-from aiogram import BaseMiddleware, Bot, Dispatcher, F, Router
-from aiogram.client.default import DefaultBotProperties
-from aiogram.enums import ChatMemberStatus, ParseMode
-from aiogram.filters import Command, StateFilter
+from aiogram import Bot, Dispatcher, Router, F, types
+from aiogram.filters import Command, CommandStart
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.types import (
-    CallbackQuery,
-    InlineKeyboardButton,
     InlineKeyboardMarkup,
-    Message,
-    MessageOriginChannel,
+    InlineKeyboardButton,
+    ReplyKeyboardMarkup,
+    KeyboardButton,
+    ReplyKeyboardRemove
 )
+from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
-try:
-    from dotenv import load_dotenv
+# Logging
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
 
-    load_dotenv()
-except ImportError:
-    pass
+# Env yuklash
+load_dotenv()
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+ADMIN_IDS = [int(x.strip()) for x in os.getenv("ADMIN_IDS", "").split(",") if x.strip()]
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-)
-logger = logging.getLogger("quizbot")
-
-BOT_TOKEN = os.environ.get("BOT_TOKEN")
-if not BOT_TOKEN:
-    raise RuntimeError("BOT_TOKEN topilmadi!")
-
-_admin_ids_raw = os.environ.get("ADMIN_IDS", "")
-ADMIN_IDS = {int(x.strip()) for x in _admin_ids_raw.split(",") if x.strip()}
-
-DB_PATH = os.environ.get("QUIZ_DB_PATH", "quiz.db")
-
-MAX_CAPTION_LEN = 1024
-MAX_MESSAGE_LEN = 4096
-
+bot = Bot(token=BOT_TOKEN)
+dp = Dispatcher(storage=MemoryStorage())
 router = Router()
+dp.include_router(router)
+scheduler = AsyncIOScheduler()
 
+# Database setup
+conn = sqlite3.connect("quiz.db", check_same_thread=False)
+cursor = conn.cursor()
 
-def esc(text: str) -> str:
-    return html.escape(text)
+def init_db():
+    cursor.execute('''
+                   CREATE TABLE IF NOT EXISTS questions (
+                                                            id INTEGER PRIMARY KEY AUTOINCREMENT,
+                                                            channel_id TEXT DEFAULT '',
+                                                            question_text TEXT,
+                                                            media_type TEXT DEFAULT 'text',
+                                                            file_id TEXT,
+                                                            answer_text TEXT NOT NULL,
+                                                            options TEXT DEFAULT ''
+                   )
+                   ''')
 
+    # Agar eski bazada channel_id ustuni bo'lmasa, uni avtomatik qo'shish
+    cursor.execute("PRAGMA table_info(questions)")
+    columns = [column[1] for column in cursor.fetchall()]
+    if 'channel_id' not in columns:
+        cursor.execute("ALTER TABLE questions ADD COLUMN channel_id TEXT DEFAULT ''")
 
-class RememberUserMiddleware(BaseMiddleware):
-    async def __call__(self, handler, event, data):
-        user = data.get("event_from_user")
-        if user is not None:
-            db_upsert_user(user.id, user.username)
-        return await handler(event, data)
+    cursor.execute('''
+                   CREATE TABLE IF NOT EXISTS user_answers (
+                                                               id INTEGER PRIMARY KEY AUTOINCREMENT,
+                                                               question_id INTEGER NOT NULL,
+                                                               user_id INTEGER NOT NULL,
+                                                               user_answer TEXT NOT NULL,
+                                                               is_correct INTEGER NOT NULL,
+                                                               UNIQUE(question_id, user_id)
+                       )
+                   ''')
+    conn.commit()
 
+init_db()
 
-router.message.outer_middleware(RememberUserMiddleware())
-
-
-def resolve_target(raw: str) -> str | int:
-    text = raw.strip()
-
-    if text.startswith("https://t.me/") or text.startswith("http://t.me/"):
-        text = "@" + text.split("t.me/")[-1].strip("/")
-    elif text.startswith("t.me/"):
-        text = "@" + text.split("t.me/")[-1].strip("/")
-
-    if text.lstrip("-").isdigit():
-        return int(text)
-
-    if not text.startswith("@"):
-        text = "@" + text
-
-    user_id = db_find_user_id_by_username(text)
-    if user_id is not None:
-        return user_id
-
-    return text
-
-
-def db_init() -> None:
-    with closing(sqlite3.connect(DB_PATH)) as con:
-        con.execute(
-            """
-            CREATE TABLE IF NOT EXISTS questions (
-                                                     id INTEGER PRIMARY KEY AUTOINCREMENT,
-                                                     question TEXT NOT NULL,
-                                                     answer TEXT NOT NULL,
-                                                     origin_chat_id INTEGER
-            )
-            """
-        )
-        try:
-            con.execute("ALTER TABLE questions ADD COLUMN origin_chat_id INTEGER")
-        except Exception:
-            pass
-        con.execute(
-            """
-            CREATE TABLE IF NOT EXISTS posts (
-                                                 chat_id INTEGER NOT NULL,
-                                                 message_id INTEGER NOT NULL,
-                                                 question_id INTEGER NOT NULL,
-                                                 PRIMARY KEY (chat_id, message_id)
-                )
-            """
-        )
-        con.execute(
-            """
-            CREATE TABLE IF NOT EXISTS users (
-                                                 user_id INTEGER PRIMARY KEY,
-                                                 username TEXT
-            )
-            """
-        )
-        con.execute(
-            """
-            CREATE TABLE IF NOT EXISTS scheduled_posts (
-                                                           id INTEGER PRIMARY KEY AUTOINCREMENT,
-                                                           channel TEXT NOT NULL,
-                                                           question TEXT NOT NULL,
-                                                           answer TEXT NOT NULL,
-                                                           photo_id TEXT,
-                                                           scheduled_at TEXT NOT NULL,
-                                                           posted INTEGER NOT NULL DEFAULT 0
-            )
-            """
-        )
-        con.commit()
-
-
-def db_upsert_user(user_id: int, username: str | None) -> None:
-    if not username:
-        return
-    with closing(sqlite3.connect(DB_PATH)) as con:
-        con.execute(
-            "INSERT OR REPLACE INTO users (user_id, username) VALUES (?, ?)",
-            (user_id, username.lower()),
-        )
-        con.commit()
-
-
-def db_find_user_id_by_username(username: str) -> int | None:
-    with closing(sqlite3.connect(DB_PATH)) as con:
-        row = con.execute(
-            "SELECT user_id FROM users WHERE username = ?",
-            (username.lower().lstrip("@"),),
-        ).fetchone()
-        return row[0] if row else None
-
-
-def db_add_post(chat_id: int, message_id: int, question_id: int) -> None:
-    with closing(sqlite3.connect(DB_PATH)) as con:
-        con.execute(
-            "INSERT OR REPLACE INTO posts (chat_id, message_id, question_id) VALUES (?, ?, ?)",
-            (chat_id, message_id, question_id),
-        )
-        con.commit()
-
-
-def db_find_question_by_post(chat_id: int, message_id: int) -> int | None:
-    with closing(sqlite3.connect(DB_PATH)) as con:
-        row = con.execute(
-            "SELECT question_id FROM posts WHERE chat_id = ? AND message_id = ?",
-            (chat_id, message_id),
-        ).fetchone()
-        return row[0] if row else None
-
-
-def db_get_post_message_id(chat_id: int, question_id: int) -> int | None:
-    with closing(sqlite3.connect(DB_PATH)) as con:
-        row = con.execute(
-            "SELECT message_id FROM posts WHERE chat_id = ? AND question_id = ? "
-            "ORDER BY message_id ASC LIMIT 1",
-            (chat_id, question_id),
-        ).fetchone()
-        return row[0] if row else None
-
-
-def db_add_question(question: str, answer: str) -> int:
-    with closing(sqlite3.connect(DB_PATH)) as con:
-        cur = con.execute(
-            "INSERT INTO questions (question, answer) VALUES (?, ?)",
-            (question, answer),
-        )
-        con.commit()
-        return cur.lastrowid
-
-
-def db_get_answer(qid: int) -> str | None:
-    with closing(sqlite3.connect(DB_PATH)) as con:
-        row = con.execute(
-            "SELECT answer FROM questions WHERE id = ?", (qid,)
-        ).fetchone()
-        return row[0] if row else None
-
-
-def db_set_origin_channel(qid: int, chat_id: int) -> None:
-    with closing(sqlite3.connect(DB_PATH)) as con:
-        con.execute(
-            "UPDATE questions SET origin_chat_id = ? WHERE id = ? AND origin_chat_id IS NULL",
-            (chat_id, qid),
-        )
-        con.commit()
-
-
-def db_get_origin_channel(qid: int) -> int | None:
-    with closing(sqlite3.connect(DB_PATH)) as con:
-        row = con.execute(
-            "SELECT origin_chat_id FROM questions WHERE id = ?", (qid,)
-        ).fetchone()
-        return row[0] if row and row[0] is not None else None
-
-
-def db_add_scheduled_post(
-        channel, question: str, answer: str, photo_id: str | None, when_iso: str
-) -> int:
-    with closing(sqlite3.connect(DB_PATH)) as con:
-        cur = con.execute(
-            "INSERT INTO scheduled_posts (channel, question, answer, photo_id, "
-            "scheduled_at, posted) VALUES (?, ?, ?, ?, ?, 0)",
-            (str(channel), question, answer, photo_id, when_iso),
-        )
-        con.commit()
-        return cur.lastrowid
-
-
-def db_get_due_scheduled_posts(now_iso: str) -> list[tuple]:
-    with closing(sqlite3.connect(DB_PATH)) as con:
-        rows = con.execute(
-            "SELECT id, channel, question, answer, photo_id FROM scheduled_posts "
-            "WHERE posted = 0 AND scheduled_at <= ?",
-            (now_iso,),
-        ).fetchall()
-        return rows
-
-
-def db_mark_scheduled_posted(sid: int) -> None:
-    with closing(sqlite3.connect(DB_PATH)) as con:
-        con.execute("UPDATE scheduled_posts SET posted = 1 WHERE id = ?", (sid,))
-        con.commit()
-
-
+# FSM States
 class AddQuestion(StatesGroup):
     waiting_channel = State()
     waiting_question = State()
     waiting_answer = State()
     waiting_schedule = State()
 
+class UserAnswerState(StatesGroup):
+    waiting_for_user_answer = State()
 
-class RepostQuestion(StatesGroup):
-    waiting_target_channel = State()
+def get_post_keyboard(q_id: int):
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="✍️ Javob yuborish", callback_data=f"answer_{q_id}")]
+    ])
 
+# Quick time keyboard for admin
+time_keyboard = ReplyKeyboardMarkup(
+    keyboard=[
+        [KeyboardButton(text="⚡️ Hozirning o'zida"), KeyboardButton(text="📅 Ertaga (shu vaqtda)")],
+        [KeyboardButton(text="📆 Sanani kiritish")]
+    ],
+    resize_keyboard=True,
+    one_time_keyboard=True
+)
 
-@router.message(Command("start"))
-async def cmd_start(message: Message) -> None:
+@router.message(CommandStart())
+async def cmd_start(message: types.Message):
+    if message.from_user.id not in ADMIN_IDS:
+        await message.answer("Siz admin emassiz.")
+        return
     await message.answer(
-        "👋 Salom! Bot ishga tushdi.\n"
+        "👋 **Salom! Bot ishga tushdi.**\n\n"
         "Post joylash uchun — /post buyrug'ini yuboring.\n"
-        "Buyruqlar ro'yxati uchun — /help"
+        "Jarayonni bekor qilish uchun — /cancel yuboring.",
+        parse_mode="Markdown"
     )
 
-
-@router.message(Command("help"))
-async def cmd_help(message: Message) -> None:
-    lines = [
-        "<b>Buyruqlar:</b>",
-        "/post — kanalga yangi savol-javob joylash",
-        "/cancel — joriy jarayonni bekor qilish",
-    ]
-    if message.from_user.id in ADMIN_IDS:
-        lines.append("/list — oxirgi qo'shilgan savollarni ko'rish")
-    await message.answer("\n".join(lines))
-
-
 @router.message(Command("cancel"))
-async def cmd_cancel(message: Message, state: FSMContext) -> None:
-    current = await state.get_state()
-    if current is None:
-        await message.answer("Hozir hech qanday jarayon yo'q.")
-        return
+async def cmd_cancel(message: types.Message, state: FSMContext):
     await state.clear()
-    await message.answer("❌ Jarayon bekor qilindi. Qaytadan /post bilan boshlashingiz mumkin.")
-
-
-@router.message(Command("list"))
-async def cmd_list(message: Message) -> None:
-    if message.from_user.id not in ADMIN_IDS:
-        return
-    with closing(sqlite3.connect(DB_PATH)) as con:
-        rows = con.execute(
-            "SELECT id, question FROM questions ORDER BY id DESC LIMIT 10"
-        ).fetchall()
-    if not rows:
-        await message.answer("Hozircha savollar yo'q.")
-        return
-    lines = ["<b>Oxirgi 10 ta savol:</b>"]
-    for qid, question in rows:
-        short = question if len(question) <= 60 else question[:57] + "..."
-        lines.append(f"#{qid} — {esc(short)}")
-    await message.answer("\n".join(lines))
-
+    await message.answer("❌ Amaliyot bekor qilindi.", reply_markup=ReplyKeyboardRemove())
 
 @router.message(Command("post"))
-async def cmd_post(message: Message, state: FSMContext) -> None:
+async def cmd_post(message: types.Message, state: FSMContext):
     if message.from_user.id not in ADMIN_IDS:
         return
     await state.set_state(AddQuestion.waiting_channel)
     await message.answer(
         "Qaysi kanalga post qilamiz?\n"
         "Kanal username yoki chat_id yuboring (masalan @mychannel yoki -1001234567890).\n"
-        "Bot o'sha kanalda admin bo'lishi shart."
+        "Bot o'sha kanalda admin bo'lishi shart.",
+        reply_markup=ReplyKeyboardRemove()
     )
 
-
-@router.message(StateFilter(AddQuestion.waiting_channel))
-async def get_channel(message: Message, state: FSMContext, bot: Bot) -> None:
-    raw = (message.text or "").strip()
-    if not raw:
-        await message.answer("Iltimos, kanal username yoki chat_id yuboring.")
-        return
-
-    channel = resolve_target(raw)
-
-    try:
-        chat = await bot.get_chat(channel)
-        member = await bot.get_chat_member(chat_id=chat.id, user_id=bot.id)
-        if member.status not in {ChatMemberStatus.ADMINISTRATOR, ChatMemberStatus.CREATOR}:
-            await message.answer(
-                f"❌ Bot '{channel}' kanalida admin emas. "
-                "Botni admin qilib qo'shing va qaytadan /post yuboring."
-            )
-            return
-    except Exception as e:
-        await message.answer(
-            f"❌ Bu kanalga kira olmadim: {e}\n\n"
-            "Qaytadan urinib ko'ring yoki /cancel bilan bekor qiling."
-        )
-        return
-
+@router.message(AddQuestion.waiting_channel)
+async def process_channel(message: types.Message, state: FSMContext):
+    channel = message.text.strip()
+    if "t.me/" in channel:
+        channel = "@" + channel.split("t.me/")[-1].replace("/", "")
     await state.update_data(channel=channel)
     await state.set_state(AddQuestion.waiting_question)
-    await message.answer(
-        f"✅ Kanal: {channel}\n"
-        "Endi savol matnini yuboring."
-    )
+    await message.answer(f"✅ Kanal: {channel}\nEndi savol matnini yuboring.\nOddiy matn yoki rasm yuborishingiz mumkin.")
 
-
-@router.message(StateFilter(AddQuestion.waiting_question))
-async def get_question(message: Message, state: FSMContext) -> None:
-    text = message.text or message.caption
-    if not text:
-        await message.answer("Iltimos, savol matnini yuboring.")
-        return
-
-    photo_id = None
+@router.message(AddQuestion.waiting_question)
+async def process_question(message: types.Message, state: FSMContext):
+    data = {}
     if message.photo:
-        photo_id = message.photo[-1].file_id
+        data['media_type'] = 'photo'
+        data['file_id'] = message.photo[-1].file_id
+        data['question_text'] = message.caption if message.caption else ""
+    else:
+        data['media_type'] = 'text'
+        data['file_id'] = None
+        data['question_text'] = message.text
 
-    await state.update_data(question=text, photo_id=photo_id)
+    await state.update_data(question_data=data)
     await state.set_state(AddQuestion.waiting_answer)
     await message.answer("Endi javobni yuboring:")
 
-
-async def publish_question(
-        bot: Bot, channel, question: str, answer: str, photo_id: str | None
-) -> int:
-    qid = db_add_question(question, answer)
-    target_chat = resolve_target(str(channel))
-
-    keyboard = InlineKeyboardMarkup(
-        inline_keyboard=[
-            [
-                InlineKeyboardButton(
-                    text="🔍 Javobni bilish", callback_data=f"ans:{qid}"
-                )
-            ]
-        ]
-    )
-
-    safe_question = esc(question)
-
-    if photo_id:
-        sent = await bot.send_photo(
-            chat_id=target_chat,
-            photo=photo_id,
-            caption=safe_question,
-            reply_markup=keyboard,
-        )
-    else:
-        sent = await bot.send_message(
-            chat_id=target_chat, text=safe_question, reply_markup=keyboard
-        )
-
-    db_add_post(sent.chat.id, sent.message_id, qid)
-    db_set_origin_channel(qid, sent.chat.id)
-    return qid
-
-
-@router.message(StateFilter(AddQuestion.waiting_answer))
-async def get_answer(message: Message, state: FSMContext, bot: Bot) -> None:
-    answer = message.text or message.caption
-    if not answer:
-        await message.answer("Iltimos, javobni matn ko'rinishida yuboring.")
-        return
-
+@router.message(AddQuestion.waiting_answer)
+async def process_answer(message: types.Message, state: FSMContext):
+    answer = message.text.strip()
     await state.update_data(answer=answer)
     await state.set_state(AddQuestion.waiting_schedule)
+
     await message.answer(
-        "Postni joylash vaqtini tanlang:\n\n"
-        "🔹 <b>Darhol joylash uchun</b> — <code>/hozir</code> deb yozing.\n\n"
-        "🔹 <b>Kelajakka rejalashtirish uchun</b> — sanani ushbu formatda yuboring:\n"
-        "<code>2026-08-15 18:30</code>"
+        "⏰ **Postni joylash vaqtini tanlang:**\n\n"
+        "🔹 Pastdagi tugmalardan birini bosing;\n",
+        parse_mode="Markdown",
+        reply_markup=time_keyboard
     )
 
+async def publish_post_to_channel(channel_id: str, question_data: dict, answer: str):
+    cursor.execute(
+        "INSERT INTO questions (channel_id, question_text, media_type, file_id, answer_text) VALUES (?, ?, ?, ?, ?)",
+        (channel_id, question_data['question_text'], question_data['media_type'], question_data['file_id'], answer)
+    )
+    conn.commit()
+    q_id = cursor.lastrowid
+    reply_markup = get_post_keyboard(q_id)
 
-@router.message(StateFilter(AddQuestion.waiting_schedule))
-async def get_schedule(message: Message, state: FSMContext, bot: Bot) -> None:
-    text = (message.text or "").strip()
+    if question_data['media_type'] == 'photo':
+        await bot.send_photo(chat_id=channel_id, photo=question_data['file_id'], caption=question_data['question_text'], reply_markup=reply_markup)
+    else:
+        await bot.send_message(chat_id=channel_id, text=question_data['question_text'], reply_markup=reply_markup)
+
+@router.message(AddQuestion.waiting_schedule)
+async def process_schedule(message: types.Message, state: FSMContext):
+    text = message.text.strip()
+
+    # 0. Sanani kiritish tugmasi bosilganda yo'riqnoma ko'rsatish
+    if text == "📆 Sanani kiritish":
+        await message.answer(
+            "✍️ **Post joylanishi kerak bo'lgan vaqtni kiriting:**\n\n"
+            "Misol uchun:\n"
+            "• `18:30` — bugun soat 18:30 da\n"
+            "• `15.08 18:30` — 15-avgust soat 18:30 da\n"
+            "• `2026-08-15 18:30` — to'liq sana va vaqt",
+            parse_mode="Markdown"
+        )
+        return
+
     data = await state.get_data()
-    channel = data["channel"]
-    question = data["question"]
-    answer = data["answer"]
-    photo_id = data.get("photo_id")
+    channel = data['channel']
+    q_data = data['question_data']
+    ans = data['answer']
 
-    if text.lower() in ("hozir", "/hozir", "now"):
-        try:
-            await publish_question(bot, channel, question, answer, photo_id)
-            await message.answer("✅ Savol kanalga joylandi.")
-        except Exception as e:
-            await message.answer(f"❌ Xatolik: {e}")
+    now = datetime.now()
+
+    # 1. Hozir joylash
+    if text in ["/hozir", "⚡️ Hozirning o'zida"]:
+        await publish_post_to_channel(channel, q_data, ans)
+        await message.answer("✅ Savol kanalga darhol joylandi.", reply_markup=ReplyKeyboardRemove())
         await state.clear()
         return
 
-    try:
-        when = datetime.datetime.strptime(text, "%Y-%m-%d %H:%M")
-    except ValueError:
-        await message.answer(
-            "Format noto'g'ri. Iltimos, darhol joylash uchun <code>/hozir</code> deb yozing "
-            "yoki sanani shu ko'rinishda yuboring: <code>2026-08-15 18:30</code>"
+    # 2. Ertaga shu vaqtda
+    if text == "📅 Ertaga (shu vaqtda)":
+        target_time = now + timedelta(days=1)
+        scheduler.add_job(
+            publish_post_to_channel,
+            'date',
+            run_date=target_time,
+            args=[channel, q_data, ans]
         )
+        await message.answer(
+            f"📅 Post ertaga joylashga rejalashtirildi: `{target_time.strftime('%Y-%m-%d %H:%M')}`",
+            parse_mode="Markdown",
+            reply_markup=ReplyKeyboardRemove()
+        )
+        await state.clear()
         return
 
-    if when <= datetime.datetime.now():
-        await message.answer(
-            "Bu vaqt allaqachon o'tib ketgan. Iltimos, kelajakdagi vaqtni kiriting."
-        )
-        return
+    # 3. Sana va soatni tahlil qilish (Parsing)
+    target_time = None
+    formats = [
+        ("%H:%M", "time_only"),             # 18:30
+        ("%d.%m %H:%M", "short_date"),       # 15.08 18:30
+        ("%d-%m %H:%M", "short_date"),       # 15-08 18:30
+        ("%Y-%m-%d %H:%M", "full_date"),     # 2026-08-15 18:30
+        ("%d.%m.%Y %H:%M", "full_date_dot") # 15.08.2026 18:30
+    ]
 
-    db_add_scheduled_post(
-        channel, question, answer, photo_id, when.strftime("%Y-%m-%d %H:%M:%S")
-    )
-    await message.answer(
-        f"🗓 Post rejalashtirildi: <b>{when.strftime('%Y-%m-%d %H:%M')}</b> vaqtida "
-        f"avtomatik joylanadi."
-    )
-    await state.clear()
-
-
-async def scheduled_posts_worker(bot: Bot) -> None:
-    while True:
+    for fmt, fmt_type in formats:
         try:
-            now_iso = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-            due = db_get_due_scheduled_posts(now_iso)
-            for sid, channel, question, answer, photo_id in due:
-                try:
-                    await publish_question(bot, channel, question, answer, photo_id)
-                    logger.info("Rejalashtirilgan post #%s kanalga joylandi.", sid)
-                    db_mark_scheduled_posted(sid)
-                except Exception as e:
-                    logger.error("Rejalashtirilgan post #%s joylashda xato: %s", sid, e)
-        except Exception as e:
-            logger.error("scheduled_posts_worker xatosi: %s", e)
-        await asyncio.sleep(30)
+            parsed = datetime.strptime(text, fmt)
+            if fmt_type == "time_only":
+                target_time = now.replace(hour=parsed.hour, minute=parsed.minute, second=0, microsecond=0)
+                if target_time < now:
+                    target_time += timedelta(days=1)
+            elif fmt_type == "short_date":
+                target_time = parsed.replace(year=now.year, second=0, microsecond=0)
+                if target_time < now:
+                    target_time = target_time.replace(year=now.year + 1)
+            else:
+                target_time = parsed
+            break
+        except ValueError:
+            continue
 
-
-@router.message(F.forward_origin, StateFilter(None))
-async def on_forwarded_post(message: Message, state: FSMContext) -> None:
-    if message.from_user.id not in ADMIN_IDS:
-        return
-
-    origin = message.forward_origin
-    if not isinstance(origin, MessageOriginChannel):
-        return
-
-    origin_chat_id = origin.chat.id
-    origin_message_id = origin.message_id
-
-    qid = db_find_question_by_post(origin_chat_id, origin_message_id)
-    if qid is None:
+    if not target_time:
         await message.answer(
-            "Bu post bizning bazamizda topilmadi."
+            "⚠️ Vaqt formati noto'g'ri kiritildi.\n\n"
+            "Iltimos, tugmalardan birini bosing yoki vaqtni quyidagicha yuboring:\n"
+            "• `18:30` (bugun)\n"
+            "• `15.08 18:30` (sana va vaqt)",
+            reply_markup=time_keyboard
         )
         return
 
-    await state.update_data(
-        origin_chat_id=origin_chat_id,
-        origin_message_id=origin_message_id,
-        qid=qid,
+    scheduler.add_job(
+        publish_post_to_channel,
+        'date',
+        run_date=target_time,
+        args=[channel, q_data, ans]
     )
-    await state.set_state(RepostQuestion.waiting_target_channel)
+
     await message.answer(
-        "✅ Savol topildi.\n"
-        "Endi shu postni qaysi kanalga qayta joylashtirishni xohlaysiz?\n"
-        "Kanal username yoki chat_id yuboring."
+        f"⏳ **Post muvaffaqiyatli rejalashtirildi!**\n"
+        f"📅 Joylanish vaqti: `{target_time.strftime('%Y-%m-%d %H:%M')}`",
+        parse_mode="Markdown",
+        reply_markup=ReplyKeyboardRemove()
     )
+    await state.clear()
 
+# Javobni tekshirish logikasi (Callback handler)
+@router.callback_query(F.data.startswith("answer_"))
+async def handle_answer_button(call: types.CallbackQuery, state: FSMContext):
+    q_id = int(call.data.split("_")[1])
+    user_id = call.from_user.id
 
-@router.message(StateFilter(RepostQuestion.waiting_target_channel))
-async def on_repost_target_channel(message: Message, state: FSMContext, bot: Bot) -> None:
-    raw = (message.text or "").strip()
-    if not raw:
-        await message.answer("Iltimos, kanal username yoki chat_id yuboring.")
+    cursor.execute("SELECT id FROM user_answers WHERE question_id=? AND user_id=?", (q_id, user_id))
+    if cursor.fetchone():
+        await call.answer("Siz bu savolga allaqachon javob bergansiz!", show_alert=True)
         return
 
-    channel = resolve_target(raw)
+    await state.update_data(active_q_id=q_id)
+    await state.set_state(UserAnswerState.waiting_for_user_answer)
+    await call.message.answer("✍️ Javobingizni yuboring:")
+    await call.answer()
 
+@router.message(UserAnswerState.waiting_for_user_answer)
+async def process_user_answer(message: types.Message, state: FSMContext):
     data = await state.get_data()
-    origin_chat_id = data["origin_chat_id"]
-    origin_message_id = data["origin_message_id"]
-    qid = data["qid"]
+    q_id = data.get("active_q_id")
+    user_id = message.from_user.id
+    user_ans = message.text.strip()
 
-    origin_link = await origin_post_link(bot, origin_chat_id, qid)
-    keyboard = InlineKeyboardMarkup(
-        inline_keyboard=[
-            [InlineKeyboardButton(text="🔍 Javobni bilish", url=origin_link)]
-        ]
-    )
+    cursor.execute("SELECT answer_text FROM questions WHERE id=?", (q_id,))
+    row = cursor.fetchone()
+    if not row:
+        await message.answer("Savol topilmadi.")
+        await state.clear()
+        return
+
+    correct_ans = row[0]
+    is_correct = 1 if user_ans.lower() == correct_ans.lower() else 0
 
     try:
-        copied = await bot.copy_message(
-            chat_id=channel,
-            from_chat_id=origin_chat_id,
-            message_id=origin_message_id,
-            reply_markup=keyboard,
+        cursor.execute(
+            "INSERT INTO user_answers (question_id, user_id, user_answer, is_correct) VALUES (?, ?, ?, ?)",
+            (q_id, user_id, user_ans, is_correct)
         )
-        target_chat = await bot.get_chat(channel)
-        db_add_post(target_chat.id, copied.message_id, qid)
-        await message.answer(f"✅ Post {channel} ga tugmasi bilan joylandi.")
-    except Exception as e:
-        await message.answer(f"❌ Xatolik: {e}")
+        conn.commit()
+    except sqlite3.IntegrityError:
+        await message.answer("Siz bu savolga allaqachon javob beribsiz.")
+        await state.clear()
+        return
+
+    if is_correct:
+        await message.answer("🎉 Barakalla! Javobingiz to'g'ri.")
+    else:
+        await message.answer(f"❌ Noto'g'ri javob. To'g'ri javob: {correct_ans}")
 
     await state.clear()
 
-
-SUBSCRIBED_STATUSES = {
-    ChatMemberStatus.MEMBER,
-    ChatMemberStatus.ADMINISTRATOR,
-    ChatMemberStatus.CREATOR,
-}
-
-
-async def is_subscribed(bot: Bot, chat_id: int, user_id: int) -> bool:
-    try:
-        member = await bot.get_chat_member(chat_id=chat_id, user_id=user_id)
-        return member.status in SUBSCRIBED_STATUSES
-    except Exception as e:
-        logger.warning("is_subscribed xatoligi: %s", e)
-        return False
-
-
-async def origin_post_link(bot: Bot, chat_id: int, qid: int) -> str:
-    chat = await bot.get_chat(chat_id)
-    message_id = db_get_post_message_id(chat_id, qid)
-
-    if chat.username and message_id:
-        return f"https://t.me/{chat.username}/{message_id}"
-    if chat.username:
-        return f"https://t.me/{chat.username}"
-    if chat.invite_link:
-        return chat.invite_link
-    link = await bot.create_chat_invite_link(chat_id=chat_id)
-    return link.invite_link
-
-
-@router.callback_query(F.data.startswith("ans:"))
-async def on_answer_click(callback: CallbackQuery, bot: Bot) -> None:
-    qid = int(callback.data.split(":", 1)[1])
-    user_id = callback.from_user.id
-
-    origin_chat_id = db_get_origin_channel(qid)
-    if origin_chat_id is None:
-        origin_chat_id = callback.message.chat.id
-
-    if await is_subscribed(bot, origin_chat_id, user_id):
-        answer = db_get_answer(qid)
-        if answer is None:
-            await callback.answer("Savol topilmadi.", show_alert=True)
-            return
-
-        await callback.answer(f"✅ Javob:\n\n{answer}", show_alert=True)
-        return
-
-    await callback.answer(
-        "Javobni bilish uchun avval kanalga obuna bo'ling!",
-        show_alert=True,
-    )
-
-
-async def main() -> None:
-    db_init()
-    bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
-    dp = Dispatcher(storage=MemoryStorage())
-    dp.include_router(router)
-
-    asyncio.create_task(scheduled_posts_worker(bot))
-
-    logger.info("Bot ishga tushdi.")
+async def main():
+    scheduler.start()
     await dp.start_polling(bot)
 
-
 if __name__ == "__main__":
+    import asyncio
     asyncio.run(main())
