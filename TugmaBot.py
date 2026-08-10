@@ -620,7 +620,12 @@ async def on_answer_click(callback: CallbackQuery, bot: Bot) -> None:
         if len(answer) <= 190:
             await callback.answer(answer, show_alert=True)
         else:
-            await callback.answer()
+            # TUZATISH: oldin bu yerda callback.answer() bo'sh (matnsiz)
+            # chaqirilardi - ekranda hech qanday bildirishnoma chiqmasdi,
+            # foydalanuvchi javob qayerga ketganini tushunmasligi mumkin edi.
+            # Endi avval DM yuborishga harakat qilamiz, natijaga qarab
+            # BITTA aniq bildirishnoma ko'rsatamiz (Telegram bitta callback
+            # so'roviga faqat bitta javob berishga ruxsat beradi).
             # TUZATISH: DM matni Telegram limitidan (4096) oshib ketmasligi
             # uchun kesib yuboriladi - bu yuqorida /post bosqichida allaqachon
             # oldini olingan, lekin qo'shimcha xavfsizlik chorasi sifatida
@@ -628,6 +633,10 @@ async def on_answer_click(callback: CallbackQuery, bot: Bot) -> None:
             text = f"✅ Javob:\n\n{esc(answer)}"[:MAX_MESSAGE_LEN]
             try:
                 await bot.send_message(chat_id=user_id, text=text)
+                await callback.answer(
+                    "✅ Javob sizning shaxsiy chatingizga yuborildi.",
+                    show_alert=True,
+                )
             except Exception as e:
                 logger.warning("Foydalanuvchiga DM yuborib bo'lmadi (user_id=%s): %s", user_id, e)
                 await callback.answer(
