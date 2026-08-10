@@ -4,24 +4,26 @@ Savol-javob kanal boti.
 TUZATISHLAR (1-bosqich):
 1. BOT_TOKEN va ADMIN_IDS endi kod ichida emas, .env faylidan o'qiladi.
 2. Foydalanuvchi kiritgan matn (savol/javob) Telegramga yuborishdan oldin
-   HTML uchun xavfsiz qilib "escape" qilinadi - aks holda matnda < > & kabi
-   belgilar bo'lsa, xabar yuborilmay xatolik chiqarardi.
-3. Ishlatilmayotgan "o'lik" callback handler (check:...) olib tashlandi -
-   uni yaratadigan hech qanday tugma yo'q edi.
-4. Matn uzunliklari Telegram limitlariga moslab tekshiriladi:
-   - caption (rasm ostidagi matn) - 1024 belgi
-   - oddiy xabar matni - 4096 belgi
-   Limitdan oshsa, foydalanuvchiga tushunarli xabar bilan qaytariladi
-   (jim-jimgina kesib yubormaymiz - bu ma'lumot yo'qolishiga olib kelardi).
-5. is_subscribed funksiyasidagi xatolik endi logga yoziladi - shunda nima
-   uchun tekshiruv ishlamayotgani (masalan, bot kanalda admin emasligi)
-   ko'rinib turadi.
-6. Kanal to'g'ri kiritilgan-kiritilmaganligi ENDI BIRINCHI QADAMDAYOQ
-   tekshiriladi (bot o'sha yerda mavjudligini ko'radi) - oldin bu faqat
-   eng oxirida, savol-javob to'liq kiritilgandan keyin aniqlanardi.
+   HTML uchun xavfsiz qilib "escape" qilinadi.
+3. Ishlatilmayotgan "o'lik" callback handler (check:...) olib tashlandi.
+4. Matn uzunliklari Telegram limitlariga moslab tekshiriladi.
+5. is_subscribed funksiyasidagi xatolik endi logga yoziladi.
+6. Kanal to'g'ri kiritilgan-kiritilmaganligi birinchi qadamdayoq tekshiriladi.
+
+TUZATISHLAR (2-bosqich):
+7. Postni darhol joylash o'rniga, javob kiritilgandan keyin admin
+   "/hozir" buyrug'ini yuborishi kerak:
+   - Darhol joylash: /hozir ni oddiy yuborasiz.
+   - Kelajakka rejalashtirish: Telegram'ning O'Z "Schedule Message"
+     funksiyasidan foydalanib, /hozir buyrug'ini xohlagan vaqtga
+     rejalashtirib yuborasiz. Telegram bu xabarni faqat belgilangan
+     vaqtda botga yetkazadi.
+   - Fallback: qo'lda "YYYY-MM-DD HH:MM" formatida sana kiritish ham
+     qo'llab-quvvatlanadi (ichki scheduled_posts_worker orqali).
 """
 
 import asyncio
+import datetime
 import html
 import logging
 import os
@@ -48,7 +50,7 @@ try:
 
     load_dotenv()
 except ImportError:
-    pass  # dotenv o'rnatilmagan bo'lsa ham, .env fayli bo'lmasa ham ishlashda davom etamiz
+    pass
 
 logging.basicConfig(
     level=logging.INFO,
@@ -56,14 +58,11 @@ logging.basicConfig(
 )
 logger = logging.getLogger("quizbot")
 
-# ---------------------------------------------------------------------------
-# Sozlamalar - endi barchasi muhit o'zgaruvchilaridan o'qiladi
-# ---------------------------------------------------------------------------
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
 if not BOT_TOKEN:
     raise RuntimeError(
-        "BOT_TOKEN topilmadi! '.env' faylini yarating (namuna: .env.example) "
-        "va BOT_TOKEN=... qatorini kiriting, yoki muhit o'zgaruvchisi sifatida o'rnating."
+        "BOT_TOKEN topilmadi! '.env' faylini yarating va BOT_TOKEN=... "
+        "qatorini kiriting, yoki muhit o'zgaruvchisi sifatida o'rnating."
     )
 
 _admin_ids_raw = os.environ.get("ADMIN_IDS", "")
@@ -76,7 +75,6 @@ if not ADMIN_IDS:
 
 DB_PATH = os.environ.get("QUIZ_DB_PATH", "quiz.db")
 
-# Telegram limitlari (rasmiy hujjatlardan)
 MAX_CAPTION_LEN = 1024
 MAX_MESSAGE_LEN = 4096
 
@@ -84,18 +82,10 @@ router = Router()
 
 
 def esc(text: str) -> str:
-    """Foydalanuvchi kiritgan matnni Telegram HTML rejimi uchun xavfsiz qiladi.
-    Buni unutish - eng ko'p uchraydigan xato manbalaridan biri: agar admin
-    savol matnida masalan '2 < 5' deb yozsa, HTML rejimida bu tag boshlanishi
-    deb noto'g'ri talqin qilinib, xabar yuborilmay xato beradi."""
     return html.escape(text)
 
 
 class RememberUserMiddleware(BaseMiddleware):
-    """Botga yozgan har bir odamning user_id/username'ini fon rejimida saqlab boradi.
-    OUTER middleware sifatida ro'yxatdan o'tkazilgan - shuning uchun HAR QANDAY
-    kiruvchi xabar uchun ishlaydi, hatto hech qanday handler unga mos kelmasa ham."""
-
     async def __call__(self, handler, event, data):
         user = data.get("event_from_user")
         if user is not None:
@@ -107,8 +97,6 @@ router.message.outer_middleware(RememberUserMiddleware())
 
 
 def resolve_target(raw: str) -> str | int:
-    """Admin yozgan manzilni (@channel, https://t.me/..., -100.., raqamli ID,
-    yoki avval botga yozgan odamning username'i) haqiqiy chat_id/@username'ga aylantiradi."""
     text = raw.strip()
 
     if text.startswith("https://t.me/") or text.startswith("http://t.me/"):
@@ -129,9 +117,6 @@ def resolve_target(raw: str) -> str | int:
     return text
 
 
-# ---------------------------------------------------------------------------
-# Ma'lumotlar bazasi
-# ---------------------------------------------------------------------------
 def db_init() -> None:
     with closing(sqlite3.connect(DB_PATH)) as con:
         con.execute(
@@ -163,6 +148,19 @@ def db_init() -> None:
             CREATE TABLE IF NOT EXISTS users (
                                                  user_id INTEGER PRIMARY KEY,
                                                  username TEXT
+            )
+            """
+        )
+        con.execute(
+            """
+            CREATE TABLE IF NOT EXISTS scheduled_posts (
+                                                           id INTEGER PRIMARY KEY AUTOINCREMENT,
+                                                           channel TEXT NOT NULL,
+                                                           question TEXT NOT NULL,
+                                                           answer TEXT NOT NULL,
+                                                           photo_id TEXT,
+                                                           scheduled_at TEXT NOT NULL,
+                                                           posted INTEGER NOT NULL DEFAULT 0
             )
             """
         )
@@ -252,13 +250,40 @@ def db_get_origin_channel(qid: int) -> int | None:
         return row[0] if row and row[0] is not None else None
 
 
-# ---------------------------------------------------------------------------
-# Admin: savol qo'shish va kanalga post qilish (FSM)
-# ---------------------------------------------------------------------------
+def db_add_scheduled_post(
+        channel, question: str, answer: str, photo_id: str | None, when_iso: str
+) -> int:
+    with closing(sqlite3.connect(DB_PATH)) as con:
+        cur = con.execute(
+            "INSERT INTO scheduled_posts (channel, question, answer, photo_id, "
+            "scheduled_at, posted) VALUES (?, ?, ?, ?, ?, 0)",
+            (str(channel), question, answer, photo_id, when_iso),
+        )
+        con.commit()
+        return cur.lastrowid
+
+
+def db_get_due_scheduled_posts(now_iso: str) -> list[tuple]:
+    with closing(sqlite3.connect(DB_PATH)) as con:
+        rows = con.execute(
+            "SELECT id, channel, question, answer, photo_id FROM scheduled_posts "
+            "WHERE posted = 0 AND scheduled_at <= ?",
+            (now_iso,),
+        ).fetchall()
+        return rows
+
+
+def db_mark_scheduled_posted(sid: int) -> None:
+    with closing(sqlite3.connect(DB_PATH)) as con:
+        con.execute("UPDATE scheduled_posts SET posted = 1 WHERE id = ?", (sid,))
+        con.commit()
+
+
 class AddQuestion(StatesGroup):
     waiting_channel = State()
     waiting_question = State()
     waiting_answer = State()
+    waiting_schedule = State()
 
 
 class RepostQuestion(StatesGroup):
@@ -335,9 +360,6 @@ async def get_channel(message: Message, state: FSMContext, bot: Bot) -> None:
 
     channel = resolve_target(raw)
 
-    # TUZATISH: kanal shu yerdayoq tekshiriladi - oldin bu faqat eng oxirida,
-    # savol va javob to'liq kiritilgandan keyin aniqlanardi va admin vaqtini
-    # behuda sarflardi.
     try:
         chat = await bot.get_chat(channel)
         member = await bot.get_chat_member(chat_id=chat.id, user_id=bot.id)
@@ -379,8 +401,6 @@ async def get_question(message: Message, state: FSMContext) -> None:
     photo_id = None
     if message.photo:
         photo_id = message.photo[-1].file_id
-        # TUZATISH: rasm captioni uchun Telegram limiti 1024 belgi -
-        # oldin bu tekshirilmasdi va yuborishda kutilmagan xatolik chiqardi.
         if len(text) > MAX_CAPTION_LEN:
             await message.answer(
                 f"❌ Rasm ostidagi matn juda uzun ({len(text)} belgi). "
@@ -399,27 +419,9 @@ async def get_question(message: Message, state: FSMContext) -> None:
     await message.answer("Endi javobni yuboring:")
 
 
-@router.message(StateFilter(AddQuestion.waiting_answer))
-async def get_answer(message: Message, state: FSMContext, bot: Bot) -> None:
-    data = await state.get_data()
-    channel = data["channel"]
-    question = data["question"]
-    photo_id = data.get("photo_id")
-
-    answer = message.text or message.caption
-    if not answer:
-        await message.answer("Iltimos, javobni matn ko'rinishida yuboring.")
-        return
-
-    # TUZATISH: javob DM orqali yuborilganda 4096 belgidan oshib ketishi
-    # mumkin edi va Telegram xato qaytarardi. Endi oldindan ogohlantiramiz.
-    if len(answer) > MAX_MESSAGE_LEN:
-        await message.answer(
-            f"❌ Javob juda uzun ({len(answer)} belgi, limit {MAX_MESSAGE_LEN}). "
-            "Iltimos, qisqartiring."
-        )
-        return
-
+async def publish_question(
+        bot: Bot, channel, question: str, answer: str, photo_id: str | None
+) -> int:
     qid = db_add_question(question, answer)
 
     keyboard = InlineKeyboardMarkup(
@@ -432,40 +434,122 @@ async def get_answer(message: Message, state: FSMContext, bot: Bot) -> None:
         ]
     )
 
-    # TUZATISH: matn HTML rejimida yuborilgani uchun endi escape qilib
-    # yuboramiz - aks holda foydalanuvchi "<" yoki "&" kabi belgi yozsa,
-    # xabar yuborilmay xato chiqardi.
     safe_question = esc(question)
 
-    try:
-        if photo_id:
-            sent = await bot.send_photo(
-                chat_id=channel,
-                photo=photo_id,
-                caption=safe_question,
-                reply_markup=keyboard,
-            )
-        else:
-            sent = await bot.send_message(
-                chat_id=channel, text=safe_question, reply_markup=keyboard
-            )
-        db_add_post(sent.chat.id, sent.message_id, qid)
-        db_set_origin_channel(qid, sent.chat.id)
-        await message.answer("✅ Savol kanalga joylandi.")
-    except Exception as e:
-        await message.answer(f"❌ Xatolik: {e}")
+    if photo_id:
+        sent = await bot.send_photo(
+            chat_id=channel,
+            photo=photo_id,
+            caption=safe_question,
+            reply_markup=keyboard,
+        )
+    else:
+        sent = await bot.send_message(
+            chat_id=channel, text=safe_question, reply_markup=keyboard
+        )
 
+    db_add_post(sent.chat.id, sent.message_id, qid)
+    db_set_origin_channel(qid, sent.chat.id)
+    return qid
+
+
+@router.message(StateFilter(AddQuestion.waiting_answer))
+async def get_answer(message: Message, state: FSMContext, bot: Bot) -> None:
+    data = await state.get_data()
+
+    answer = message.text or message.caption
+    if not answer:
+        await message.answer("Iltimos, javobni matn ko'rinishida yuboring.")
+        return
+
+    if len(answer) > MAX_MESSAGE_LEN:
+        await message.answer(
+            f"❌ Javob juda uzun ({len(answer)} belgi, limit {MAX_MESSAGE_LEN}). "
+            "Iltimos, qisqartiring."
+        )
+        return
+
+    await state.update_data(answer=answer)
+    await state.set_state(AddQuestion.waiting_schedule)
+    await message.answer(
+        "Postni joylash uchun quyidagi buyruqni yuboring:\n\n"
+        "<code>/hozir</code>\n\n"
+        "🔹 <b>Darhol joylash uchun</b> — shu buyruqni oddiy yuboring.\n\n"
+        "🔹 <b>Kelajakka rejalashtirish uchun</b> — Telegram'ning o'z "
+        "\"Rejalashtirilgan xabar\" funksiyasidan foydalaning:\n"
+        "   1. <code>/hozir</code> deb yozing (yubormang)\n"
+        "   2. Yuborish (✈️) tugmasini <b>uzoq bosib turing</b>\n"
+        "   3. \"Rejalashtirish\" / \"Schedule Message\" ni tanlang\n"
+        "   4. Xohlagan sana va vaqtni belgilang\n\n"
+        "Telegram bu xabarni faqat siz belgilagan vaqtda botga yetkazadi, "
+        "va bot o'sha zahoti postni avtomatik joylaydi.\n\n"
+        "Yoki oddiy sana formatida ham kiritishingiz mumkin: "
+        "<code>2026-08-15 18:30</code>"
+    )
+
+
+@router.message(StateFilter(AddQuestion.waiting_schedule))
+async def get_schedule(message: Message, state: FSMContext, bot: Bot) -> None:
+    text = (message.text or "").strip()
+    data = await state.get_data()
+    channel = data["channel"]
+    question = data["question"]
+    answer = data["answer"]
+    photo_id = data.get("photo_id")
+
+    if text.lower() in ("hozir", "/hozir", "now"):
+        try:
+            await publish_question(bot, channel, question, answer, photo_id)
+            await message.answer("✅ Savol kanalga joylandi.")
+        except Exception as e:
+            await message.answer(f"❌ Xatolik: {e}")
+        await state.clear()
+        return
+
+    try:
+        when = datetime.datetime.strptime(text, "%Y-%m-%d %H:%M")
+    except ValueError:
+        await message.answer(
+            "Formatga amal qilinmadi. Iltimos, <code>/hozir</code> deb yozing "
+            "(darhol yoki Telegram orqali rejalashtirib) yoki sanani shu "
+            "ko'rinishda yuboring: <code>2026-08-15 18:30</code>"
+        )
+        return
+
+    if when <= datetime.datetime.now():
+        await message.answer(
+            "Bu vaqt allaqachon o'tib ketgan. Iltimos, kelajakdagi vaqtni kiriting."
+        )
+        return
+
+    db_add_scheduled_post(
+        channel, question, answer, photo_id, when.strftime("%Y-%m-%d %H:%M:%S")
+    )
+    await message.answer(
+        f"🗓 Post rejalashtirildi: <b>{when.strftime('%Y-%m-%d %H:%M')}</b> vaqtida "
+        f"avtomatik joylanadi.\n"
+        "(Bot shu vaqtda ishlab turishi kerak - server doimiy ishlaydigan bo'lsa muammo yo'q.)"
+    )
     await state.clear()
 
 
-# ---------------------------------------------------------------------------
-# Postni boshqa kanalga "qayta joylashtirish" (forward orqali tanib olish)
-# ---------------------------------------------------------------------------
-# ESLATMA: MemoryStorage ishlatilgani uchun bot FSM jarayoni o'rtasida qayta
-# ishga tushsa (masalan, server qayta yuklansa), admin boshlagan jarayon
-# holati yo'qoladi. Bitta shaxsiy bot uchun bu odatda muammo emas, lekin
-# doimiy ishlaydigan katta loyihada RedisStorage kabi saqlovchi storage'ga
-# o'tish tavsiya etiladi.
+async def scheduled_posts_worker(bot: Bot) -> None:
+    while True:
+        try:
+            now_iso = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            due = db_get_due_scheduled_posts(now_iso)
+            for sid, channel, question, answer, photo_id in due:
+                try:
+                    await publish_question(bot, channel, question, answer, photo_id)
+                except Exception as e:
+                    logger.error("Rejalashtirilgan postni joylashda xato: %s", e)
+                finally:
+                    db_mark_scheduled_posted(sid)
+        except Exception as e:
+            logger.error("scheduled_posts_worker xatosi: %s", e)
+        await asyncio.sleep(30)
+
+
 @router.message(F.forward_origin, StateFilter(None))
 async def on_forwarded_post(message: Message, state: FSMContext) -> None:
     if message.from_user.id not in ADMIN_IDS:
@@ -512,9 +596,6 @@ async def on_repost_target_channel(message: Message, state: FSMContext, bot: Bot
     origin_message_id = data["origin_message_id"]
     qid = data["qid"]
 
-    # Bu yerdagi tugma CALLBACK emas, balki oddiy URL tugma bo'ladi - bosilgan
-    # zahoti, asosiy postga olib boradi. U yerda odam a'zo bo'lmasa, Telegram
-    # o'zi "JOIN CHANNEL" taklifini avtomatik ko'rsatadi.
     origin_link = await origin_post_link(bot, origin_chat_id, qid)
     keyboard = InlineKeyboardMarkup(
         inline_keyboard=[
@@ -549,9 +630,6 @@ async def on_repost_target_channel(message: Message, state: FSMContext, bot: Bot
     await state.clear()
 
 
-# ---------------------------------------------------------------------------
-# Obunani tekshirish
-# ---------------------------------------------------------------------------
 SUBSCRIBED_STATUSES = {
     ChatMemberStatus.MEMBER,
     ChatMemberStatus.ADMINISTRATOR,
@@ -564,10 +642,6 @@ async def is_subscribed(bot: Bot, chat_id: int, user_id: int) -> bool:
         member = await bot.get_chat_member(chat_id=chat_id, user_id=user_id)
         return member.status in SUBSCRIBED_STATUSES
     except Exception as e:
-        # TUZATISH: xatolik endi jimgina yutilmaydi, logga yoziladi.
-        # Aks holda, masalan bot kanalda admin bo'lmay qolsa yoki Telegram
-        # API vaqtincha ishlamasa, HAQIQIY obunachilar ham "obuna emassiz"
-        # deb ko'rsatilardi va sababi hech qayerda ko'rinmasdi.
         logger.warning(
             "is_subscribed tekshiruvida xatolik (chat_id=%s, user_id=%s): %s",
             chat_id, user_id, e,
@@ -599,9 +673,6 @@ async def origin_post_link(bot: Bot, chat_id: int, qid: int) -> str:
     return link.invite_link
 
 
-# ---------------------------------------------------------------------------
-# "🔍 Javobni bilish" tugmasi bosilganda
-# ---------------------------------------------------------------------------
 @router.callback_query(F.data.startswith("ans:"))
 async def on_answer_click(callback: CallbackQuery, bot: Bot) -> None:
     qid = int(callback.data.split(":", 1)[1])
@@ -616,20 +687,9 @@ async def on_answer_click(callback: CallbackQuery, bot: Bot) -> None:
         if answer is None:
             await callback.answer("Savol topilmadi.", show_alert=True)
             return
-        # Telegram alert (popup) matni ~200 belgigacha cheklangan.
         if len(answer) <= 190:
             await callback.answer(answer, show_alert=True)
         else:
-            # TUZATISH: oldin bu yerda callback.answer() bo'sh (matnsiz)
-            # chaqirilardi - ekranda hech qanday bildirishnoma chiqmasdi,
-            # foydalanuvchi javob qayerga ketganini tushunmasligi mumkin edi.
-            # Endi avval DM yuborishga harakat qilamiz, natijaga qarab
-            # BITTA aniq bildirishnoma ko'rsatamiz (Telegram bitta callback
-            # so'roviga faqat bitta javob berishga ruxsat beradi).
-            # TUZATISH: DM matni Telegram limitidan (4096) oshib ketmasligi
-            # uchun kesib yuboriladi - bu yuqorida /post bosqichida allaqachon
-            # oldini olingan, lekin qo'shimcha xavfsizlik chorasi sifatida
-            # bu yerda ham qoldirildi.
             text = f"✅ Javob:\n\n{esc(answer)}"[:MAX_MESSAGE_LEN]
             try:
                 await bot.send_message(chat_id=user_id, text=text)
@@ -652,12 +712,14 @@ async def on_answer_click(callback: CallbackQuery, bot: Bot) -> None:
     )
 
 
-# ---------------------------------------------------------------------------
 async def main() -> None:
     db_init()
     bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
     dp = Dispatcher(storage=MemoryStorage())
     dp.include_router(router)
+
+    asyncio.create_task(scheduled_posts_worker(bot))
+
     logger.info("Bot ishga tushdi.")
     await dp.start_polling(bot)
 
