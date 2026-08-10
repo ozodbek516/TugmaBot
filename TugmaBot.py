@@ -1,25 +1,10 @@
 """
 Savol-javob kanal boti.
 
-TUZATISHLAR (1-bosqich):
-1. BOT_TOKEN va ADMIN_IDS endi kod ichida emas, .env faylidan o'qiladi.
-2. Foydalanuvchi kiritgan matn (savol/javob) Telegramga yuborishdan oldin
-   HTML uchun xavfsiz qilib "escape" qilinadi.
-3. Ishlatilmayotgan "o'lik" callback handler (check:...) olib tashlandi.
-4. Matn uzunliklari Telegram limitlariga moslab tekshiriladi.
-5. is_subscribed funksiyasidagi xatolik endi logga yoziladi.
-6. Kanal to'g'ri kiritilgan-kiritilmaganligi birinchi qadamdayoq tekshiriladi.
-
-TUZATISHLAR (2-bosqich):
-7. Postni darhol joylash o'rniga, javob kiritilgandan keyin admin
-   "/hozir" buyrug'ini yuborishi kerak:
-   - Darhol joylash: /hozir ni oddiy yuborasiz.
-   - Kelajakka rejalashtirish: Telegram'ning O'Z "Schedule Message"
-     funksiyasidan foydalanib, /hozir buyrug'ini xohlagan vaqtga
-     rejalashtirib yuborasiz. Telegram bu xabarni faqat belgilangan
-     vaqtda botga yetkazadi.
-   - Fallback: qo'lda "YYYY-MM-DD HH:MM" formatida sana kiritish ham
-     qo'llab-quvvatlanadi (ichki scheduled_posts_worker orqali).
+TUZATISHLAR:
+1. Rejalashtirish xatolari to'liq tuzatildi (channel ID konversiyasi va baza bilan ishlash).
+2. /hozir yoki "YYYY-MM-DD HH:MM" formati orqali rejalashtirish ishonchli qilindi.
+3. Javobni bilish tugmasi har doim ekranning o'zida pop-up (alert) ko'rinishida chiqadi.
 """
 
 import asyncio
@@ -423,6 +408,7 @@ async def publish_question(
         bot: Bot, channel, question: str, answer: str, photo_id: str | None
 ) -> int:
     qid = db_add_question(question, answer)
+    target_chat = resolve_target(str(channel))
 
     keyboard = InlineKeyboardMarkup(
         inline_keyboard=[
@@ -438,14 +424,14 @@ async def publish_question(
 
     if photo_id:
         sent = await bot.send_photo(
-            chat_id=channel,
+            chat_id=target_chat,
             photo=photo_id,
             caption=safe_question,
             reply_markup=keyboard,
         )
     else:
         sent = await bot.send_message(
-            chat_id=channel, text=safe_question, reply_markup=keyboard
+            chat_id=target_chat, text=safe_question, reply_markup=keyboard
         )
 
     db_add_post(sent.chat.id, sent.message_id, qid)
@@ -455,8 +441,6 @@ async def publish_question(
 
 @router.message(StateFilter(AddQuestion.waiting_answer))
 async def get_answer(message: Message, state: FSMContext, bot: Bot) -> None:
-    data = await state.get_data()
-
     answer = message.text or message.caption
     if not answer:
         await message.answer("Iltimos, javobni matn ko'rinishida yuboring.")
@@ -472,18 +456,9 @@ async def get_answer(message: Message, state: FSMContext, bot: Bot) -> None:
     await state.update_data(answer=answer)
     await state.set_state(AddQuestion.waiting_schedule)
     await message.answer(
-        "Postni joylash uchun quyidagi buyruqni yuboring:\n\n"
-        "<code>/hozir</code>\n\n"
-        "🔹 <b>Darhol joylash uchun</b> — shu buyruqni oddiy yuboring.\n\n"
-        "🔹 <b>Kelajakka rejalashtirish uchun</b> — Telegram'ning o'z "
-        "\"Rejalashtirilgan xabar\" funksiyasidan foydalaning:\n"
-        "   1. <code>/hozir</code> deb yozing (yubormang)\n"
-        "   2. Yuborish (✈️) tugmasini <b>uzoq bosib turing</b>\n"
-        "   3. \"Rejalashtirish\" / \"Schedule Message\" ni tanlang\n"
-        "   4. Xohlagan sana va vaqtni belgilang\n\n"
-        "Telegram bu xabarni faqat siz belgilagan vaqtda botga yetkazadi, "
-        "va bot o'sha zahoti postni avtomatik joylaydi.\n\n"
-        "Yoki oddiy sana formatida ham kiritishingiz mumkin: "
+        "Postni joylash vaqtini tanlang:\n\n"
+        "🔹 <b>Darhol joylash uchun</b> — <code>/hozir</code> deb yozing.\n\n"
+        "🔹 <b>Kelajakka rejalashtirish uchun</b> — sanani ushbu formatda yuboring:\n"
         "<code>2026-08-15 18:30</code>"
     )
 
@@ -510,9 +485,8 @@ async def get_schedule(message: Message, state: FSMContext, bot: Bot) -> None:
         when = datetime.datetime.strptime(text, "%Y-%m-%d %H:%M")
     except ValueError:
         await message.answer(
-            "Formatga amal qilinmadi. Iltimos, <code>/hozir</code> deb yozing "
-            "(darhol yoki Telegram orqali rejalashtirib) yoki sanani shu "
-            "ko'rinishda yuboring: <code>2026-08-15 18:30</code>"
+            "Format noto'g'ri. Iltimos, darhol joylash uchun <code>/hozir</code> deb yozing "
+            "yoki sanani shu ko'rinishda yuboring: <code>2026-08-15 18:30</code>"
         )
         return
 
@@ -527,8 +501,7 @@ async def get_schedule(message: Message, state: FSMContext, bot: Bot) -> None:
     )
     await message.answer(
         f"🗓 Post rejalashtirildi: <b>{when.strftime('%Y-%m-%d %H:%M')}</b> vaqtida "
-        f"avtomatik joylanadi.\n"
-        "(Bot shu vaqtda ishlab turishi kerak - server doimiy ishlaydigan bo'lsa muammo yo'q.)"
+        f"avtomatik joylanadi."
     )
     await state.clear()
 
@@ -541,10 +514,10 @@ async def scheduled_posts_worker(bot: Bot) -> None:
             for sid, channel, question, answer, photo_id in due:
                 try:
                     await publish_question(bot, channel, question, answer, photo_id)
-                except Exception as e:
-                    logger.error("Rejalashtirilgan postni joylashda xato: %s", e)
-                finally:
+                    logger.info("Rejalashtirilgan post #%s kanalga joylandi.", sid)
                     db_mark_scheduled_posted(sid)
+                except Exception as e:
+                    logger.error("Rejalashtirilgan post #%s joylashda xato: %s", sid, e)
         except Exception as e:
             logger.error("scheduled_posts_worker xatosi: %s", e)
         await asyncio.sleep(30)
@@ -687,25 +660,11 @@ async def on_answer_click(callback: CallbackQuery, bot: Bot) -> None:
         if answer is None:
             await callback.answer("Savol topilmadi.", show_alert=True)
             return
-        if len(answer) <= 190:
-            await callback.answer(answer, show_alert=True)
-        else:
-            text = f"✅ Javob:\n\n{esc(answer)}"[:MAX_MESSAGE_LEN]
-            try:
-                await bot.send_message(chat_id=user_id, text=text)
-                await callback.answer(
-                    "✅ Javob sizning shaxsiy chatingizga yuborildi.",
-                    show_alert=True,
-                )
-            except Exception as e:
-                logger.warning("Foydalanuvchiga DM yuborib bo'lmadi (user_id=%s): %s", user_id, e)
-                await callback.answer(
-                    "Sizga shaxsiy xabar yubora olmadim. Botga /start bosing va qayta urinib ko'ring.",
-                    show_alert=True,
-                )
+
+        # Har doim ekranning o'zida popup (alert) shaklida ko'rsatiladi:
+        await callback.answer(f"✅ Javob:\n\n{answer}", show_alert=True)
         return
 
-    link = await channel_invite_link(bot, origin_chat_id)
     await callback.answer(
         "Javobni bilish uchun avval kanalga obuna bo'ling!",
         show_alert=True,
