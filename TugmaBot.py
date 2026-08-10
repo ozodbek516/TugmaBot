@@ -1,10 +1,5 @@
 """
 Savol-javob kanal boti.
-
-TUZATISHLAR:
-1. Rejalashtirish xatolari to'liq tuzatildi (channel ID konversiyasi va baza bilan ishlash).
-2. /hozir yoki "YYYY-MM-DD HH:MM" formati orqali rejalashtirish ishonchli qilindi.
-3. Javobni bilish tugmasi har doim ekranning o'zida pop-up (alert) ko'rinishida chiqadi.
 """
 
 import asyncio
@@ -45,18 +40,10 @@ logger = logging.getLogger("quizbot")
 
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
 if not BOT_TOKEN:
-    raise RuntimeError(
-        "BOT_TOKEN topilmadi! '.env' faylini yarating va BOT_TOKEN=... "
-        "qatorini kiriting, yoki muhit o'zgaruvchisi sifatida o'rnating."
-    )
+    raise RuntimeError("BOT_TOKEN topilmadi!")
 
 _admin_ids_raw = os.environ.get("ADMIN_IDS", "")
 ADMIN_IDS = {int(x.strip()) for x in _admin_ids_raw.split(",") if x.strip()}
-if not ADMIN_IDS:
-    logger.warning(
-        "ADMIN_IDS bo'sh! Hech kim /post buyrug'idan foydalana olmaydi. "
-        ".env faylida ADMIN_IDS=123,456 kabi kiriting."
-    )
 
 DB_PATH = os.environ.get("QUIZ_DB_PATH", "quiz.db")
 
@@ -357,9 +344,6 @@ async def get_channel(message: Message, state: FSMContext, bot: Bot) -> None:
     except Exception as e:
         await message.answer(
             f"❌ Bu kanalga kira olmadim: {e}\n\n"
-            "Tekshiring:\n"
-            "1) Username/ID to'g'ri yozilganmi?\n"
-            "2) Bot o'sha kanalga admin sifatida qo'shilganmi?\n\n"
             "Qaytadan urinib ko'ring yoki /cancel bilan bekor qiling."
         )
         return
@@ -368,8 +352,7 @@ async def get_channel(message: Message, state: FSMContext, bot: Bot) -> None:
     await state.set_state(AddQuestion.waiting_question)
     await message.answer(
         f"✅ Kanal: {channel}\n"
-        "Endi savol matnini yuboring.\n"
-        "Oddiy matn yoki rasm (pastida savol matni/caption bilan) yuborishingiz mumkin."
+        "Endi savol matnini yuboring."
     )
 
 
@@ -377,27 +360,12 @@ async def get_channel(message: Message, state: FSMContext, bot: Bot) -> None:
 async def get_question(message: Message, state: FSMContext) -> None:
     text = message.text or message.caption
     if not text:
-        await message.answer(
-            "Iltimos, savol matnini yuboring (rasm bilan yubormoqchi bo'lsangiz, "
-            "rasm ostiga matn/caption qo'shing)."
-        )
+        await message.answer("Iltimos, savol matnini yuboring.")
         return
 
     photo_id = None
     if message.photo:
         photo_id = message.photo[-1].file_id
-        if len(text) > MAX_CAPTION_LEN:
-            await message.answer(
-                f"❌ Rasm ostidagi matn juda uzun ({len(text)} belgi). "
-                f"Rasm bilan birga eng ko'pi {MAX_CAPTION_LEN} belgigacha matn bo'lishi mumkin.\n"
-                "Matnni qisqartiring yoki rasmsiz, oddiy xabar sifatida yuboring."
-            )
-            return
-    elif len(text) > MAX_MESSAGE_LEN:
-        await message.answer(
-            f"❌ Savol matni juda uzun ({len(text)} belgi, limit {MAX_MESSAGE_LEN})."
-        )
-        return
 
     await state.update_data(question=text, photo_id=photo_id)
     await state.set_state(AddQuestion.waiting_answer)
@@ -444,13 +412,6 @@ async def get_answer(message: Message, state: FSMContext, bot: Bot) -> None:
     answer = message.text or message.caption
     if not answer:
         await message.answer("Iltimos, javobni matn ko'rinishida yuboring.")
-        return
-
-    if len(answer) > MAX_MESSAGE_LEN:
-        await message.answer(
-            f"❌ Javob juda uzun ({len(answer)} belgi, limit {MAX_MESSAGE_LEN}). "
-            "Iltimos, qisqartiring."
-        )
         return
 
     await state.update_data(answer=answer)
@@ -538,7 +499,7 @@ async def on_forwarded_post(message: Message, state: FSMContext) -> None:
     qid = db_find_question_by_post(origin_chat_id, origin_message_id)
     if qid is None:
         await message.answer(
-            "Bu post bizning bazamizda topilmadi (bot orqali joylanmagan bo'lishi mumkin)."
+            "Bu post bizning bazamizda topilmadi."
         )
         return
 
@@ -551,7 +512,7 @@ async def on_forwarded_post(message: Message, state: FSMContext) -> None:
     await message.answer(
         "✅ Savol topildi.\n"
         "Endi shu postni qaysi kanalga qayta joylashtirishni xohlaysiz?\n"
-        "Kanal username yoki chat_id yuboring (masalan @mychannel)."
+        "Kanal username yoki chat_id yuboring."
     )
 
 
@@ -587,18 +548,7 @@ async def on_repost_target_channel(message: Message, state: FSMContext, bot: Bot
         db_add_post(target_chat.id, copied.message_id, qid)
         await message.answer(f"✅ Post {channel} ga tugmasi bilan joylandi.")
     except Exception as e:
-        err_text = str(e)
-        if "chat not found" in err_text.lower():
-            await message.answer(
-                "❌ Chat topilmadi. Buning ikki sababi bo'lishi mumkin:\n\n"
-                "1️⃣ Agar bu KANAL yoki GURUH bo'lsa — bot o'sha yerda admin "
-                "ekanligini va username to'g'ri yozilganini tekshiring.\n\n"
-                "2️⃣ Agar bu ODAM (shaxsiy chat) bo'lsa — bot unga birinchi "
-                "yoza olmaydi. O'sha odam avval botga o'zi yozib, /start "
-                "bosishi shart. Shundan keyingina qayta urinib ko'ring."
-            )
-        else:
-            await message.answer(f"❌ Xatolik: {e}")
+        await message.answer(f"❌ Xatolik: {e}")
 
     await state.clear()
 
@@ -615,21 +565,8 @@ async def is_subscribed(bot: Bot, chat_id: int, user_id: int) -> bool:
         member = await bot.get_chat_member(chat_id=chat_id, user_id=user_id)
         return member.status in SUBSCRIBED_STATUSES
     except Exception as e:
-        logger.warning(
-            "is_subscribed tekshiruvida xatolik (chat_id=%s, user_id=%s): %s",
-            chat_id, user_id, e,
-        )
+        logger.warning("is_subscribed xatoligi: %s", e)
         return False
-
-
-async def channel_invite_link(bot: Bot, chat_id: int) -> str:
-    chat = await bot.get_chat(chat_id)
-    if chat.username:
-        return f"https://t.me/{chat.username}"
-    if chat.invite_link:
-        return chat.invite_link
-    link = await bot.create_chat_invite_link(chat_id=chat_id)
-    return link.invite_link
 
 
 async def origin_post_link(bot: Bot, chat_id: int, qid: int) -> str:
@@ -661,7 +598,6 @@ async def on_answer_click(callback: CallbackQuery, bot: Bot) -> None:
             await callback.answer("Savol topilmadi.", show_alert=True)
             return
 
-        # Har doim ekranning o'zida popup (alert) shaklida ko'rsatiladi:
         await callback.answer(f"✅ Javob:\n\n{answer}", show_alert=True)
         return
 
