@@ -14,9 +14,9 @@ from aiogram.types import (
     InlineKeyboardButton,
     ReplyKeyboardMarkup,
     KeyboardButton,
-    ReplyKeyboardRemove,
-    MessageOriginChannel
+    ReplyKeyboardRemove
 )
+from aiogram.exceptions import TelegramBadRequest
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
 # Logging
@@ -77,26 +77,31 @@ class AddQuestion(StatesGroup):
 class RepostQuestion(StatesGroup):
     waiting_target_channel = State()
 
-# Post havolasini hosil qiluvchi yordamchi funksiya
-async def get_post_keyboard(chat_id: str, message_id: int):
-    post_link = None
-    try:
-        chat = await bot.get_chat(chat_id)
-        if chat.username:
-            post_link = f"https://t.me/{chat.username}/{message_id}"
-        else:
-            # Agar kanal shaxsiy (private) bo'lsa va username bo'lmasa, chat_id ni tozalab ko'ramiz (-100 ni olib tashlab)
-            clean_id = str(chat_id).replace("-100", "")
-            post_link = f"https://t.me/c/{clean_id}/{message_id}"
-    except Exception:
-        pass
-
-    if not post_link:
-        post_link = "https://t.me/"
-
+def get_post_keyboard(q_id: int):
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="🔍 Javobni bilish", url=post_link)]
+        [InlineKeyboardButton(text="🔍 Javobni bilish", callback_data=f"get_ans_{q_id}")]
     ])
+
+# Forward qilingan kanallar uchun esa to'g'ridan-to'g'ri asl postga olib boradigan URL tugma
+async def get_repost_keyboard(q_id: int):
+    cursor.execute("SELECT chat_id, message_id FROM posts WHERE question_id=? ORDER BY message_id ASC LIMIT 1", (q_id,))
+    row = cursor.fetchone()
+    if row:
+        p_chat_id, p_msg_id = row
+        try:
+            chat = await bot.get_chat(p_chat_id)
+            if chat.username:
+                return InlineKeyboardMarkup(inline_keyboard=[
+                    [InlineKeyboardButton(text="🔍 Javobni bilish", url=f"https://t.me/{chat.username}/{p_msg_id}")]
+                ])
+            else:
+                clean_id = str(p_chat_id).replace("-100", "")
+                return InlineKeyboardMarkup(inline_keyboard=[
+                    [InlineKeyboardButton(text="🔍 Javobni bilish", url=f"https://t.me/c/{clean_id}/{p_msg_id}")]
+                ])
+        except Exception:
+            pass
+    return get_post_keyboard(q_id)
 
 # Vaqt tugmalari
 time_keyboard = ReplyKeyboardMarkup(
@@ -181,16 +186,12 @@ async def publish_post_to_channel(channel_id: str, question_data: dict, answer: 
     )
     conn.commit()
     q_id = cursor.lastrowid
+    reply_markup = get_post_keyboard(q_id)
 
-    # Avval vaqtincha oddiy xabar yuboramiz (message_id olish uchun)
     if question_data['media_type'] == 'photo':
-        sent = await bot.send_photo(chat_id=channel_id, photo=question_data['file_id'], caption=question_data['question_text'])
+        sent = await bot.send_photo(chat_id=channel_id, photo=question_data['file_id'], caption=question_data['question_text'], reply_markup=reply_markup)
     else:
-        sent = await bot.send_message(chat_id=channel_id, text=question_data['question_text'])
-
-    # O'sha xabarning o'ziga to'g'ridan-to'g'ri o'tkazadigan linkli tugmani o'rnatamiz
-    keyboard = await get_post_keyboard(str(sent.chat.id), sent.message_id)
-    await bot.edit_message_reply_markup(chat_id=channel_id, message_id=sent.message_id, reply_markup=keyboard)
+        sent = await bot.send_message(chat_id=channel_id, text=question_data['question_text'], reply_markup=reply_markup)
 
     cursor.execute("INSERT OR REPLACE INTO posts (chat_id, message_id, question_id) VALUES (?, ?, ?)",
                    (str(sent.chat.id), sent.message_id, q_id))
@@ -316,17 +317,16 @@ async def on_repost_target_channel(message: types.Message, state: FSMContext):
     origin_message_id = data["origin_message_id"]
     q_id = data["q_id"]
 
+    # Forward qilingan kanal uchun maxsus URL tugma ishlatamiz (asl postga olib boradi)
+    reply_markup = await get_repost_keyboard(q_id)
+
     try:
-        # Avval nusxa ko'chirib yuboramiz
         copied = await bot.copy_message(
             chat_id=target_channel,
             from_chat_id=origin_chat_id,
-            message_id=origin_message_id
+            message_id=origin_message_id,
+            reply_markup=reply_markup
         )
-        # Yangi kanalga mos keluvchi to'g'ri post havolali tugmani qo'shamiz
-        keyboard = await get_post_keyboard(str(copied.chat.id), copied.message_id)
-        await bot.edit_message_reply_markup(chat_id=target_channel, message_id=copied.message_id, reply_markup=keyboard)
-
         cursor.execute("INSERT OR REPLACE INTO posts (chat_id, message_id, question_id) VALUES (?, ?, ?)",
                        (str(copied.chat.id), copied.message_id, q_id))
         conn.commit()
@@ -336,6 +336,59 @@ async def on_repost_target_channel(message: types.Message, state: FSMContext):
         await message.answer(f"❌ Xatolik: {e}")
 
     await state.clear()
+
+async def check_subscription(chat_id: str, user_id: int) -> bool:
+    try:
+        member = await bot.get_chat_member(chat_id=chat_id, user_id=user_id)
+        if member.status in ["member", "administrator", "creator"]:
+            return True
+    except TelegramBadRequest:
+        pass
+    return False
+
+# Original kanaldagi tugma bosilganda obunani tekshirish va javobni ko'rsatish
+@router.callback_query(F.data.startswith("get_ans_"))
+async def handle_get_answer(call: types.CallbackQuery):
+    q_id = int(call.data.split("_")[2])
+    user_id = call.from_user.id
+    chat_id = str(call.message.chat.id)
+    message_id = call.message.message_id
+
+    # Asl kanalni topish
+    cursor.execute("SELECT channel_id, answer_text FROM questions WHERE id=?", (q_id,))
+    row = cursor.fetchone()
+
+    if not row:
+        cursor.execute("SELECT question_id FROM posts WHERE chat_id=? AND message_id=?", (chat_id, message_id))
+        p_row = cursor.fetchone()
+        if p_row:
+            cursor.execute("SELECT channel_id, answer_text FROM questions WHERE id=?", (p_row[0],))
+            row = cursor.fetchone()
+
+    if not row:
+        await call.answer("Savol topilmadi.", show_alert=True)
+        return
+
+    channel_id, answer_text = row[0], row[1]
+
+    # Obunani tekshiramiz
+    if channel_id:
+        is_subbed = await check_subscription(channel_id, user_id)
+        if not is_subbed:
+            clean_channel = channel_id.replace('@', '')
+            keyboard = InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="📢 Kanalga obuna bo'lish", url=f"https://t.me/{clean_channel}")],
+                [InlineKeyboardButton(text="🔄 Tekshirish", callback_data=call.data)]
+            ])
+            await call.answer("Javobni ko'rish uchun avval kanalga obuna bo'ling!", show_alert=True)
+            await call.message.answer(
+                "Botdan foydalanish va javobni ko'rish uchun quyidagi kanalga obuna bo'lishingiz kerak:",
+                reply_markup=keyboard
+            )
+            return
+
+    # Obuna bo'lgan bo'lsa to'g'ri javobni ko'rsatamiz
+    await call.answer(f"✅ To'g'ri javob: {answer_text}", show_alert=True)
 
 async def main():
     scheduler.start()
