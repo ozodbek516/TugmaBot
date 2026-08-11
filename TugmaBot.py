@@ -14,10 +14,12 @@ from aiogram.types import (
     InlineKeyboardButton,
     ReplyKeyboardMarkup,
     KeyboardButton,
-    ReplyKeyboardRemove
+    ReplyKeyboardRemove,
+    MessageOriginChannel
 )
 from aiogram.exceptions import TelegramBadRequest
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
+from apscheduler.jobstores.sqlalchemy import SQLAlchemyJobStore
 
 # Logging
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
@@ -31,7 +33,12 @@ bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher(storage=MemoryStorage())
 router = Router()
 dp.include_router(router)
-scheduler = AsyncIOScheduler()
+
+# Scheduler bazada saqlanadigan qilindi (rejalashtirilgan postlar o'chib ketmaydi)
+jobstores = {
+    'default': SQLAlchemyJobStore(url='sqlite:///jobs.sqlite')
+}
+scheduler = AsyncIOScheduler(jobstores=jobstores)
 
 # Database setup
 conn = sqlite3.connect("quiz.db", check_same_thread=False)
@@ -180,22 +187,32 @@ async def process_answer(message: types.Message, state: FSMContext):
     )
 
 async def publish_post_to_channel(channel_id: str, question_data: dict, answer: str):
-    cursor.execute(
-        "INSERT INTO questions (channel_id, question_text, media_type, file_id, answer_text) VALUES (?, ?, ?, ?, ?)",
-        (channel_id, question_data['question_text'], question_data['media_type'], question_data['file_id'], answer)
-    )
-    conn.commit()
-    q_id = cursor.lastrowid
-    reply_markup = get_post_keyboard(q_id)
+    try:
+        local_conn = sqlite3.connect("quiz.db")
+        local_cursor = local_conn.cursor()
+        local_cursor.execute(
+            "INSERT INTO questions (channel_id, question_text, media_type, file_id, answer_text) VALUES (?, ?, ?, ?, ?)",
+            (channel_id, question_data['question_text'], question_data['media_type'], question_data['file_id'], answer)
+        )
+        local_conn.commit()
+        q_id = local_cursor.lastrowid
+        local_conn.close()
 
-    if question_data['media_type'] == 'photo':
-        sent = await bot.send_photo(chat_id=channel_id, photo=question_data['file_id'], caption=question_data['question_text'], reply_markup=reply_markup)
-    else:
-        sent = await bot.send_message(chat_id=channel_id, text=question_data['question_text'], reply_markup=reply_markup)
+        reply_markup = get_post_keyboard(q_id)
 
-    cursor.execute("INSERT OR REPLACE INTO posts (chat_id, message_id, question_id) VALUES (?, ?, ?)",
-                   (str(sent.chat.id), sent.message_id, q_id))
-    conn.commit()
+        if question_data['media_type'] == 'photo':
+            sent = await bot.send_photo(chat_id=channel_id, photo=question_data['file_id'], caption=question_data['question_text'], reply_markup=reply_markup)
+        else:
+            sent = await bot.send_message(chat_id=channel_id, text=question_data['question_text'], reply_markup=reply_markup)
+
+        save_conn = sqlite3.connect("quiz.db")
+        save_cursor = save_conn.cursor()
+        save_cursor.execute("INSERT OR REPLACE INTO posts (chat_id, message_id, question_id) VALUES (?, ?, ?)",
+                            (str(sent.chat.id), sent.message_id, q_id))
+        save_conn.commit()
+        save_conn.close()
+    except Exception as e:
+        logging.error(f"Rejalashtirilgan postni yuborishda xatolik: {e}")
 
 @router.message(AddQuestion.waiting_schedule)
 async def process_schedule(message: types.Message, state: FSMContext):
@@ -317,7 +334,6 @@ async def on_repost_target_channel(message: types.Message, state: FSMContext):
     origin_message_id = data["origin_message_id"]
     q_id = data["q_id"]
 
-    # Forward qilingan kanal uchun maxsus URL tugma ishlatamiz (asl postga olib boradi)
     reply_markup = await get_repost_keyboard(q_id)
 
     try:
@@ -346,7 +362,7 @@ async def check_subscription(chat_id: str, user_id: int) -> bool:
         pass
     return False
 
-# Original kanaldagi tugma bosilganda obunani tekshirish va javobni ko'rsatish
+# "Javobni bilish" bosilganda faqat popup orqali alert chiqarish
 @router.callback_query(F.data.startswith("get_ans_"))
 async def handle_get_answer(call: types.CallbackQuery):
     q_id = int(call.data.split("_")[2])
@@ -354,7 +370,6 @@ async def handle_get_answer(call: types.CallbackQuery):
     chat_id = str(call.message.chat.id)
     message_id = call.message.message_id
 
-    # Asl kanalni topish
     cursor.execute("SELECT channel_id, answer_text FROM questions WHERE id=?", (q_id,))
     row = cursor.fetchone()
 
@@ -371,23 +386,13 @@ async def handle_get_answer(call: types.CallbackQuery):
 
     channel_id, answer_text = row[0], row[1]
 
-    # Obunani tekshiramiz
     if channel_id:
         is_subbed = await check_subscription(channel_id, user_id)
         if not is_subbed:
-            clean_channel = channel_id.replace('@', '')
-            keyboard = InlineKeyboardMarkup(inline_keyboard=[
-                [InlineKeyboardButton(text="📢 Kanalga obuna bo'lish", url=f"https://t.me/{clean_channel}")],
-                [InlineKeyboardButton(text="🔄 Tekshirish", callback_data=call.data)]
-            ])
-            await call.answer("Javobni ko'rish uchun avval kanalga obuna bo'ling!", show_alert=True)
-            await call.message.answer(
-                "Botdan foydalanish va javobni ko'rish uchun quyidagi kanalga obuna bo'lishingiz kerak:",
-                reply_markup=keyboard
-            )
+            # Kanalga hech qanday xabar yuborilmaydi, faqat alert chiqadi
+            await call.answer("Javobni bilish uchun kanalga obuna bo'ling", show_alert=True)
             return
 
-    # Obuna bo'lgan bo'lsa to'g'ri javobni ko'rsatamiz
     await call.answer(f"✅ To'g'ri javob: {answer_text}", show_alert=True)
 
 async def main():
