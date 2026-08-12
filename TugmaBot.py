@@ -396,7 +396,8 @@ async def handle_get_answer(call: types.CallbackQuery):
     await call.answer(f"✅ To'g'ri javob: {answer_text}", show_alert=True)
 
 async def main():
-    scheduler.start()
+    if not scheduler.running:
+        scheduler.start()
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
