@@ -34,7 +34,7 @@ dp = Dispatcher(storage=MemoryStorage())
 router = Router()
 dp.include_router(router)
 
-# Scheduler bazada saqlanadigan qilindi (rejalashtirilgan postlar o'chib ketmaydi)
+# Scheduler bazada saqlanadigan qilindi
 jobstores = {
     'default': SQLAlchemyJobStore(url='sqlite:///jobs.sqlite')
 }
@@ -89,7 +89,6 @@ def get_post_keyboard(q_id: int):
         [InlineKeyboardButton(text="🔍 Javobni bilish", callback_data=f"get_ans_{q_id}")]
     ])
 
-# Forward qilingan kanallar uchun esa to'g'ridan-to'g'ri asl postga olib boradigan URL tugma
 async def get_repost_keyboard(q_id: int):
     cursor.execute("SELECT chat_id, message_id FROM posts WHERE question_id=? ORDER BY message_id ASC LIMIT 1", (q_id,))
     row = cursor.fetchone()
@@ -110,7 +109,6 @@ async def get_repost_keyboard(q_id: int):
             pass
     return get_post_keyboard(q_id)
 
-# Vaqt tugmalari
 time_keyboard = ReplyKeyboardMarkup(
     keyboard=[
         [KeyboardButton(text="⚡️ Hozirning o'zida")],
@@ -186,24 +184,26 @@ async def process_answer(message: types.Message, state: FSMContext):
         reply_markup=time_keyboard
     )
 
-async def publish_post_to_channel(channel_id: str, question_data: dict, answer: str):
+# Rejalashtirilgan postni yuborish funksiyasi (ID orqali ishlaydi)
+async def publish_post_to_channel(q_id: int):
     try:
         local_conn = sqlite3.connect("quiz.db")
         local_cursor = local_conn.cursor()
-        local_cursor.execute(
-            "INSERT INTO questions (channel_id, question_text, media_type, file_id, answer_text) VALUES (?, ?, ?, ?, ?)",
-            (channel_id, question_data['question_text'], question_data['media_type'], question_data['file_id'], answer)
-        )
-        local_conn.commit()
-        q_id = local_cursor.lastrowid
+        local_cursor.execute("SELECT channel_id, question_text, media_type, file_id, answer_text FROM questions WHERE id = ?", (q_id,))
+        row = local_cursor.fetchone()
         local_conn.close()
 
+        if not row:
+            logging.error(f"Post bazadan topilmadi, ID: {q_id}")
+            return
+
+        channel_id, question_text, media_type, file_id, answer_text = row
         reply_markup = get_post_keyboard(q_id)
 
-        if question_data['media_type'] == 'photo':
-            sent = await bot.send_photo(chat_id=channel_id, photo=question_data['file_id'], caption=question_data['question_text'], reply_markup=reply_markup)
+        if media_type == 'photo' and file_id:
+            sent = await bot.send_photo(chat_id=channel_id, photo=file_id, caption=question_text or "", reply_markup=reply_markup)
         else:
-            sent = await bot.send_message(chat_id=channel_id, text=question_data['question_text'], reply_markup=reply_markup)
+            sent = await bot.send_message(chat_id=channel_id, text=question_text, reply_markup=reply_markup)
 
         save_conn = sqlite3.connect("quiz.db")
         save_cursor = save_conn.cursor()
@@ -211,8 +211,9 @@ async def publish_post_to_channel(channel_id: str, question_data: dict, answer: 
                             (str(sent.chat.id), sent.message_id, q_id))
         save_conn.commit()
         save_conn.close()
+        logging.info(f"Post muvaffaqiyatli kanalga yuborildi, ID: {q_id}")
     except Exception as e:
-        logging.error(f"Rejalashtirilgan postni yuborishda xatolik: {e}")
+        logging.error(f"Rejalashtirilgan postni yuborishda xatolik (ID: {q_id}): {e}")
 
 @router.message(AddQuestion.waiting_schedule)
 async def process_schedule(message: types.Message, state: FSMContext):
@@ -236,8 +237,19 @@ async def process_schedule(message: types.Message, state: FSMContext):
 
     now = datetime.now()
 
+    # Avval savolni bazaga yozib qoldiramiz va uning ID sini olamiz
+    local_conn = sqlite3.connect("quiz.db")
+    local_cursor = local_conn.cursor()
+    local_cursor.execute(
+        "INSERT INTO questions (channel_id, question_text, media_type, file_id, answer_text) VALUES (?, ?, ?, ?, ?)",
+        (channel, q_data['question_text'], q_data['media_type'], q_data['file_id'], ans)
+    )
+    local_conn.commit()
+    q_id = local_cursor.lastrowid
+    local_conn.close()
+
     if text in ["/hozir", "⚡️ Hozirning o'zida"]:
-        await publish_post_to_channel(channel, q_data, ans)
+        await publish_post_to_channel(q_id)
         await message.answer("✅ Savol kanalga darhol joylandi.", reply_markup=ReplyKeyboardRemove())
         await state.clear()
         return
@@ -278,11 +290,12 @@ async def process_schedule(message: types.Message, state: FSMContext):
         )
         return
 
+    # Scheduler'ga faqat ID yuboriladi
     scheduler.add_job(
         publish_post_to_channel,
         'date',
         run_date=target_time,
-        args=[channel, q_data, ans]
+        args=[q_id]
     )
 
     await message.answer(
@@ -344,10 +357,10 @@ async def on_repost_target_channel(message: types.Message, state: FSMContext):
             reply_markup=reply_markup
         )
         cursor.execute("INSERT OR REPLACE INTO posts (chat_id, message_id, question_id) VALUES (?, ?, ?)",
-                       (str(copied.chat.id), copied.message_id, q_id))
+                       (str(target_channel), copied.message_id, q_id))
         conn.commit()
 
-        await message.answer(f"✅ Post {target_channel} kanaliga tarqatildi!")
+        await message.answer(f"✅ Post {target_channel} kanaliga joylandi!")
     except Exception as e:
         await message.answer(f"❌ Xatolik: {e}")
 
@@ -362,7 +375,6 @@ async def check_subscription(chat_id: str, user_id: int) -> bool:
         pass
     return False
 
-# "Javobni bilish" bosilganda faqat popup orqali alert chiqarish
 @router.callback_query(F.data.startswith("get_ans_"))
 async def handle_get_answer(call: types.CallbackQuery):
     q_id = int(call.data.split("_")[2])
@@ -389,11 +401,10 @@ async def handle_get_answer(call: types.CallbackQuery):
     if channel_id:
         is_subbed = await check_subscription(channel_id, user_id)
         if not is_subbed:
-            # Kanalga hech qanday xabar yuborilmaydi, faqat alert chiqadi
             await call.answer("Javobni bilish uchun kanalga obuna bo'ling", show_alert=True)
             return
 
-    await call.answer(f"✅ To'g'ri javob: {answer_text}", show_alert=True)
+    await call.answer(f"Javob: {answer_text}", show_alert=True)
 
 async def main():
     if not scheduler.running:
