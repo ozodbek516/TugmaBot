@@ -2,6 +2,7 @@ import os
 import sqlite3
 import logging
 from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo
 from dotenv import load_dotenv
 
 from aiogram import Bot, Dispatcher, Router, F, types
@@ -235,7 +236,8 @@ async def process_schedule(message: types.Message, state: FSMContext):
     q_data = data['question_data']
     ans = data['answer']
 
-    now = datetime.now()
+    TASHKENT_TZ = ZoneInfo("Asia/Tashkent")
+    now = datetime.now(TASHKENT_TZ).replace(tzinfo=None)
 
     # Avval savolni bazaga yozib qoldiramiz va uning ID sini olamiz
     local_conn = sqlite3.connect("quiz.db")
@@ -289,6 +291,10 @@ async def process_schedule(message: types.Message, state: FSMContext):
             reply_markup=time_keyboard
         )
         return
+
+    # Vaqtni Toshkent mintaqasiga moslaymiz
+    if target_time.tzinfo is None:
+        target_time = target_time.replace(tzinfo=TASHKENT_TZ)
 
     # Scheduler'ga faqat ID yuboriladi
     scheduler.add_job(
