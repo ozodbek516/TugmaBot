@@ -410,7 +410,7 @@ async def handle_get_answer(call: types.CallbackQuery):
             await call.answer("Javobni bilish uchun kanalga obuna bo'ling", show_alert=True)
             return
 
-    await call.answer(f"Javob: {answer_text}", show_alert=True)
+    await call.answer(f"{answer_text}", show_alert=True)
 
 async def main():
     if not scheduler.running:
