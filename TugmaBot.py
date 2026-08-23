@@ -418,7 +418,7 @@ async def handle_get_answer(call: types.CallbackQuery):
                 text=f"💡 **To'g'ri javob:**\n\n{answer_text}",
                 parse_mode="Markdown"
             )
-            await call.answer("✅ Javob shaxsiy xatingizga yuborildi!", show_alert=False)
+            await call.answer("✅ Javob shaxsiy chatingizga yuborildi!", show_alert=False)
         except Exception:
             await call.answer("⚠️ Botga start bosmagansiz, shaxsiyga yozib bo'lmadi!", show_alert=True)
     else:
