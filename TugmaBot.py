@@ -417,7 +417,7 @@ async def handle_get_answer(call: types.CallbackQuery):
             text=f"💡 **To'g'ri javob:**\n\n{answer_text}",
             parse_mode="Markdown"
         )
-        await call.answer("✅ Javob shaxsiy xatingizga yuborildi!", show_alert=False)
+        await call.answer("✅ Javob shaxsiy chatingizga yuborildi!", show_alert=False)
     except Exception:
         # Agar foydalanuvchi botga start bosmagan bo'lsa, xatolik chiqmasligi uchun qisqa qilib alertda chiqaramiz
         short_ans = answer_text[:190] + "..." if len(answer_text) > 190 else answer_text
