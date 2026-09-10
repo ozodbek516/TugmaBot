@@ -410,19 +410,6 @@ async def handle_get_answer(call: types.CallbackQuery):
             await call.answer("Javobni bilish uchun kanalga obuna bo'ling", show_alert=True)
             return
 
-    # Agar javob 200 ta belgidan ko'p bo'lsa — shaxsiy xatga yuboramiz
-    if len(answer_text) > 200:
-        try:
-            await bot.send_message(
-                chat_id=user_id,
-                text=f"💡 **To'g'ri javob:**\n\n{answer_text}",
-                parse_mode="Markdown"
-            )
-            await call.answer("✅ Javob shaxsiy chatingizga yuborildi!", show_alert=False)
-        except Exception:
-            await call.answer("⚠️ Botga start bosmagansiz, shaxsiyga yozib bo'lmadi!", show_alert=True)
-    else:
-        # 200 ta belgidan kam bo'lsa — eskiide alert oynasida chiqaraveradi
         await call.answer(f"{answer_text}", show_alert=True)
 
 async def main():
