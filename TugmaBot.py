@@ -176,6 +176,18 @@ async def process_question(message: types.Message, state: FSMContext):
 @router.message(AddQuestion.waiting_answer)
 async def process_answer(message: types.Message, state: FSMContext):
     answer = message.text.strip()
+
+    # Agar javob 200 tadan ko'p bo'lsa:
+    if len(answer) > 200:
+        await message.answer(
+            "❌ **Javob 200 tadan ko'p!**\n"
+            "Bu postni kanalga joylay olmaysiz.",
+            parse_mode="Markdown",
+            reply_markup=ReplyKeyboardRemove()
+        )
+        await state.clear()
+        return
+
     await state.update_data(answer=answer)
     await state.set_state(AddQuestion.waiting_schedule)
 
@@ -323,7 +335,7 @@ async def on_forwarded_post(message: types.Message, state: FSMContext):
         return
 
     origin_chat_id = str(origin.chat.id)
-    origin_message_id = origin.message_id
+    origin_message_id = message.message_id
 
     cursor.execute("SELECT question_id FROM posts WHERE chat_id = ? AND message_id = ?", (origin_chat_id, origin_message_id))
     row = cursor.fetchone()
