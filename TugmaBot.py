@@ -335,7 +335,7 @@ async def on_forwarded_post(message: types.Message, state: FSMContext):
         return
 
     origin_chat_id = str(origin.chat.id)
-    origin_message_id = message.message_id
+    origin_message_id = origin.message_id
 
     cursor.execute("SELECT question_id FROM posts WHERE chat_id = ? AND message_id = ?", (origin_chat_id, origin_message_id))
     row = cursor.fetchone()
